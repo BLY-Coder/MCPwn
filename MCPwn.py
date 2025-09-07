@@ -13,6 +13,7 @@ from typing import Dict, Any, List, Tuple
 import time
 import hashlib
 import sys
+import re
 
 try:
     from dotenv import load_dotenv
@@ -460,7 +461,26 @@ _RISKY_VERBS = (
     "sql", "query", "http", "fetch", "download", "upload",
 )
 
-_POISON_TAGS = ("<hidden>", "</hidden>", "<important>", "</important>")
+# Heuristics for hidden/poisoned instructions in tool descriptions
+_POISON_PATTERNS: List[Tuple[str, re.Pattern]] = [
+    ("html_comment", re.compile(r"<!--[\s\S]*?-->", re.IGNORECASE)),
+    ("hidden_tag", re.compile(r"<(hidden|important|secret|private)>[\s\S]*?</\1>", re.IGNORECASE)),
+    ("css_hidden", re.compile(r"display\s*:\s*none|aria-hidden\s*=\s*\"?true\"?", re.IGNORECASE)),
+    ("prompt_instr", re.compile(r"ignore\s+previous\s+instructions|do\s+not\s+mention|silently|covertly", re.IGNORECASE)),
+    ("precondition_access", re.compile(r"before\s+.*?you\s+must\s+.*?(access|read).*?(system|internal)://", re.IGNORECASE)),
+    ("long_base64ish", re.compile(r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{40,}={0,2}(?![A-Za-z0-9+/=])")),
+    ("zero_width", re.compile(r"[\u200b-\u200f\u2060]")),
+]
+
+
+def _detect_poison(text: str) -> List[str]:
+    if not text:
+        return []
+    hits: List[str] = []
+    for name, pat in _POISON_PATTERNS:
+        if pat.search(text):
+            hits.append(name)
+    return hits
 
 
 def _collect_text_from_content(content: Any, limit: int = 8000) -> str:
@@ -478,11 +498,13 @@ def _collect_text_from_content(content: Any, limit: int = 8000) -> str:
 
 def analyze_tool_risks(tool: Dict[str, Any]) -> Dict[str, Any]:
     name = (tool.get("name") or "").lower()
-    desc = (tool.get("description") or "").lower()
+    desc_raw = tool.get("description") or ""
+    desc = desc_raw.lower()
     schema = tool.get("inputSchema") or {}
 
     risky_terms = [v for v in _RISKY_VERBS if v in name or v in desc]
-    has_poison_tags = any(tag in desc for tag in _POISON_TAGS)
+    poison_matches = _detect_poison(desc_raw)
+    has_poison_tags = bool(poison_matches)
     schema_is_object = isinstance(schema, dict) and schema.get("type") == "object"
     props = schema.get("properties") if schema_is_object else None
     schema_anomaly = (not schema_is_object) or (isinstance(props, dict) and len(props) == 0)
@@ -498,6 +520,7 @@ def analyze_tool_risks(tool: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "risky_terms": risky_terms,
         "has_poison_tags": has_poison_tags,
+        "poison_matches": poison_matches,
         "schema_anomaly": schema_anomaly,
         "score": score,
     }
@@ -941,6 +964,8 @@ if __name__ == "__main__":
                         help="Save a baseline inventory snapshot to this path and exit")
     parser.add_argument("--diff", type=Path,
                         help="Diff current inventory against this baseline JSON and print a summary")
+    parser.add_argument("--audit-llm", action="store_true",
+                        help="Augment audit with an LLM (Claude) summary and prioritized findings")
 
     args = parser.parse_args()
 
@@ -996,6 +1021,33 @@ if __name__ == "__main__":
                 rep = audit_inventory(h, timeout=args.timeout, verify=verify, token=args.token, proxies=proxies, headers=extra_headers, http_path=args.http_path, sse_path=args.sse_path)
                 print_audit_report(rep)
                 all_reports.append(rep)
+                if args.audit_llm:
+                    # Best-effort LLM summary if key available
+                    try:
+                        _load_env_file(None)
+                        if anthropic is None:
+                            raise RuntimeError("anthropic not installed")
+                        ak = os.getenv("ANTHROPIC_API_KEY")
+                        if not ak:
+                            raise RuntimeError("ANTHROPIC_API_KEY not set")
+                        acli = anthropic.Anthropic(api_key=ak)
+                        prompt = (
+                            "You are a security auditor. Given this MCP audit JSON, extract high-signal findings, "
+                            "prioritize by risk, and propose next steps. Be concise.\n\nJSON:\n" +
+                            json.dumps(rep, ensure_ascii=False)
+                        )
+                        msg = acli.messages.create(
+                            model=(args.model or "claude-sonnet-4-20250514"),
+                            max_tokens=500,
+                            messages=[{"role": "user", "content": prompt}],
+                        )
+                        llm_text = "\n".join([getattr(b, "text", "") for b in (msg.content or []) if getattr(b, "type", None) == "text"]).strip()
+                        if llm_text:
+                            print("\n--- LLM Summary ---")
+                            print(llm_text)
+                            print("-------------------\n")
+                    except Exception as e:
+                        print(f"[!] LLM summary skipped: {e}")
             except Exception as e:
                 print(f"[!] Audit failed for {h}: {e}")
         if args.audit_json:
