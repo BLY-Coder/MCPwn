@@ -12,6 +12,7 @@ import os
 from typing import Dict, Any, List, Tuple
 import time
 import hashlib
+import sys
 
 try:
     from dotenv import load_dotenv
@@ -830,23 +831,38 @@ def chat_with_claude(hosts: List[str], model: str, **kwargs) -> None:
         "- Summarize evidence with clear references (tool name, input, high-level result).\n\n"
         "When you call a tool, provide precise, minimal arguments. After a tool result, analyze briefly and decide the next best action."
     )
+    # Simple ANSI colors (no external deps)
+    C_GRAY = "\033[90m"; C_CYAN = "\033[36m"; C_GREEN = "\033[32m"; C_RESET = "\033[0m"
+
     history: List[Dict[str, Any]] = []
-    print("Chat started. Type your message (Ctrl+C to exit).\n")
+    print(f"{C_GRAY}Chat started (model: {model}). Type your message (Ctrl+C to exit).{C_RESET}\n")
     try:
         while True:
             user_input = input("> ").strip()
             if not user_input:
                 continue
             history.append({"role": "user", "content": user_input})
-            max_iters = 5
+            max_iters = 4
             for _ in range(max_iters):
-                msg = client.messages.create(
+                # Stream assistant response to reduce perceived latency
+                with client.messages.stream(
                     model=model,
                     system=system_prompt,
                     messages=history,
                     tools=tools,
-                    max_tokens=1024,
-                )
+                    max_tokens=512,
+                    temperature=0.2,
+                ) as stream:
+                    sys.stdout.write(f"{C_CYAN}assistant:{C_RESET} ")
+                    sys.stdout.flush()
+                    for event in stream:
+                        # Stream partial text
+                        if getattr(event, "type", None) == "content_block_delta" and getattr(event.delta, "type", None) == "text_delta":
+                            sys.stdout.write(event.delta.text)
+                            sys.stdout.flush()
+                    msg = stream.get_final_message()
+                    print()  # newline after stream
+
                 assistant_blocks = msg.content or []
                 tool_uses = [b for b in assistant_blocks if getattr(b, "type", None) == "tool_use"]
                 text_blocks = [b for b in assistant_blocks if getattr(b, "type", None) == "text"]
@@ -856,7 +872,10 @@ def chat_with_claude(hosts: List[str], model: str, **kwargs) -> None:
                 })
                 if not tool_uses:
                     final_text = "\n".join([getattr(b, "text", "") for b in text_blocks]).strip()
-                    print(final_text or "(no response)")
+                    if final_text:
+                        pass  # already printed via stream
+                    else:
+                        print("(no response)")
                     break
                 tool_results = []
                 for tu in tool_uses:
@@ -869,6 +888,8 @@ def chat_with_claude(hosts: List[str], model: str, **kwargs) -> None:
                         "tool_use_id": getattr(tu, "id", ""),
                         "content": result_text,
                     })
+                    # Pretty-print tool result immediately
+                    print(f"{C_GREEN}tool_result [{name}]{C_RESET}\n```\n{result_text}\n```")
                 history.append({"role": "user", "content": tool_results})
     except KeyboardInterrupt:
         print("\nExiting…")
