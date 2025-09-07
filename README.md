@@ -34,6 +34,8 @@ python3 MCPwn.py localhost:9001 internal://credentials
 python3 MCPwn.py --audit localhost:9001
 # Optional JSON report
 python3 MCPwn.py --audit --audit-json /tmp/audit.json localhost:9001
+# Augment with LLM (Claude) summary if ANTHROPIC_API_KEY is set
+python3 MCPwn.py --audit --audit-llm localhost:9001
 ```
 
 **Baseline & diff:**
@@ -46,7 +48,7 @@ python3 MCPwn.py --diff /tmp/base.json localhost:9001
 
 **Chat (Claude + MCP tools):**
 ```bash
-# Requires ANTHROPIC_API_KEY in /opt/MCPwn/.env
+# Requires ANTHROPIC_API_KEY in /opt/MCPwn/.env (auto-loaded)
 python3 MCPwn.py --chat localhost:9001
 ```
 
@@ -75,6 +77,7 @@ python3 MCPwn.py --proxy http://127.0.0.1:8080 localhost:9001
 -t TIMEOUT        # Request timeout
 -T THREADS        # Concurrent threads
 --audit           # Quick audit with risk hints & safe error probing
+--audit-llm       # Add Claude summary/prioritization to audit (if key present)
 --baseline FILE   # Save baseline inventory snapshot
 --diff FILE       # Diff current inventory against baseline
 --chat            # Interactive chat (Claude) using MCP tools
