@@ -10,6 +10,8 @@ import tempfile
 import json
 import os
 from typing import Dict, Any, List, Tuple
+import time
+import hashlib
 
 try:
     from dotenv import load_dotenv
@@ -448,6 +450,252 @@ def get_mcp_info(host, **kwargs):
             "error": str(e)
         }
 
+#############################################
+# General MCP Auditing Utilities (vendor-agnostic)
+#############################################
+
+_RISKY_VERBS = (
+    "exec", "execute", "run", "shell", "command", "system", "eval",
+    "sql", "query", "http", "fetch", "download", "upload",
+)
+
+_POISON_TAGS = ("<hidden>", "</hidden>", "<important>", "</important>")
+
+
+def _collect_text_from_content(content: Any, limit: int = 8000) -> str:
+    if isinstance(content, list):
+        texts = []
+        for c in content:
+            if isinstance(c, dict) and c.get("type") == "text":
+                texts.append(str(c.get("text", "")))
+        if texts:
+            return "\n".join(texts)[:limit]
+    if isinstance(content, str):
+        return content[:limit]
+    return json.dumps(content, ensure_ascii=False)[:limit]
+
+
+def analyze_tool_risks(tool: Dict[str, Any]) -> Dict[str, Any]:
+    name = (tool.get("name") or "").lower()
+    desc = (tool.get("description") or "").lower()
+    schema = tool.get("inputSchema") or {}
+
+    risky_terms = [v for v in _RISKY_VERBS if v in name or v in desc]
+    has_poison_tags = any(tag in desc for tag in _POISON_TAGS)
+    schema_is_object = isinstance(schema, dict) and schema.get("type") == "object"
+    props = schema.get("properties") if schema_is_object else None
+    schema_anomaly = (not schema_is_object) or (isinstance(props, dict) and len(props) == 0)
+
+    score = 0
+    if risky_terms:
+        score += 2
+    if has_poison_tags:
+        score += 2
+    if schema_anomaly:
+        score += 1
+
+    return {
+        "risky_terms": risky_terms,
+        "has_poison_tags": has_poison_tags,
+        "schema_anomaly": schema_anomaly,
+        "score": score,
+    }
+
+
+def _make_invalid_args_from_schema(schema: Dict[str, Any]) -> List[Dict[str, Any]]:
+    invalids: List[Dict[str, Any]] = []
+    if not isinstance(schema, dict) or schema.get("type") != "object":
+        # Generic invalid
+        invalids.append({"__invalid": True})
+        return invalids
+
+    props: Dict[str, Any] = schema.get("properties", {}) or {}
+    required = set(schema.get("required", []) or [])
+
+    # Case 1: missing required
+    if required:
+        invalids.append({})
+
+    # Case 2: type mismatches for up to 3 props
+    for i, (k, v) in enumerate(props.items()):
+        if i >= 3:
+            break
+        t = v.get("type")
+        bad: Any = "not-valid"
+        if t == "integer" or t == "number":
+            bad = "NaN"
+        elif t == "boolean":
+            bad = "not-bool"
+        elif t == "array":
+            bad = "not-array"
+        elif t == "object":
+            bad = "string-instead-of-object"
+        invalids.append({k: bad})
+
+    return invalids or [{"__invalid": True}]
+
+
+def safe_error_probe(host: str, mcp: "MCP", tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    findings: List[Dict[str, Any]] = []
+    for tool in tools:
+        schema = tool.get("inputSchema") or {}
+        invalids = _make_invalid_args_from_schema(schema)
+        for args in invalids[:2]:  # keep it light
+            try:
+                res = mcp.call_tool(tool.get("name"), args)
+                txt = _collect_text_from_content(res)
+                # If it succeeded with clearly invalid args, flag it
+                findings.append({
+                    "tool": tool.get("name"),
+                    "probe": args,
+                    "result_excerpt": txt[:300],
+                    "issue": "Accepted invalid input without error" if txt else "Unexpected success",
+                })
+            except Exception as e:
+                msg = str(e)
+                leak_signals = any(w in msg.lower() for w in ("token", "key=", "private", "traceback", "/app/", "\\"))
+                findings.append({
+                    "tool": tool.get("name"),
+                    "probe": args,
+                    "error_excerpt": msg[:300],
+                    "issue": "Sensitive error detail" if leak_signals else "Error returned",
+                })
+    return findings
+
+
+def audit_inventory(host: str, **kwargs) -> Dict[str, Any]:
+    """One-host quick audit with generic, non-destructive checks."""
+    t0 = time.time()
+    mcp = MCP.new(host, **kwargs)
+    t1 = time.time()
+    tools = mcp.list_tools(); t2 = time.time()
+    resources = mcp.list_resources(); t3 = time.time()
+    prompts = mcp.list_prompts(); t4 = time.time()
+
+    tool_reports = []
+    for t in tools:
+        tool_reports.append({
+            "name": t.get("name"),
+            "description": t.get("description", ""),
+            "risk": analyze_tool_risks(t),
+        })
+
+    # Non-destructive resource sampling: only list metadata
+    resource_summaries = []
+    for r in resources[:10]:
+        resource_summaries.append({k: r.get(k) for k in ("name", "uri", "description", "mimeType") if k in r})
+
+    # Light error probing
+    error_findings = safe_error_probe(host, mcp, tools[:10])
+
+    return {
+        "host": host,
+        "server": mcp.server_info,
+        "tool_count": len(tools),
+        "resource_count": len(resources),
+        "prompt_count": len(prompts),
+        "timings_ms": {
+            "connect_initialize": int((t1 - t0) * 1000),
+            "list_tools": int((t2 - t1) * 1000),
+            "list_resources": int((t3 - t2) * 1000),
+            "list_prompts": int((t4 - t3) * 1000),
+        },
+        "tools": tool_reports,
+        "resources_sample": resource_summaries,
+        "error_findings": error_findings,
+    }
+
+
+def print_audit_report(data: Dict[str, Any]) -> None:
+    print(f"\n=== MCP Quick Audit: {data['host']} ===")
+    si = data.get("server", {})
+    print(f"Server: {si.get('name','unknown')} | Version: {si.get('version','?')}")
+    print(f"Tools: {data.get('tool_count',0)} | Resources: {data.get('resource_count',0)} | Prompts: {data.get('prompt_count',0)}\n")
+    tm = data.get("timings_ms", {})
+    if tm:
+        print(f"Timings (ms): init={tm.get('connect_initialize',0)} tools={tm.get('list_tools',0)} resources={tm.get('list_resources',0)} prompts={tm.get('list_prompts',0)}\n")
+
+    print("-- Tools (top risks) --")
+    sorted_tools = sorted(data.get("tools", []), key=lambda x: x.get("risk", {}).get("score", 0), reverse=True)
+    for t in sorted_tools[:15]:
+        r = t.get("risk", {})
+        if r.get("score", 0) == 0:
+            continue
+        print(f"* {t.get('name')}: score={r.get('score')} risky_terms={r.get('risky_terms')} schema_anomaly={r.get('schema_anomaly')} poison={r.get('has_poison_tags')}")
+
+    ef = data.get("error_findings", [])
+    if ef:
+        print("\n-- Error Probing Findings --")
+        for f in ef[:15]:
+            issue = f.get("issue")
+            print(f"* {f.get('tool')}: {issue}")
+    print()
+
+
+# Baseline & Diff utilities
+def _sha256_of(obj: Any) -> str:
+    try:
+        data = json.dumps(obj, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    except Exception:
+        data = str(obj).encode("utf-8")
+    return hashlib.sha256(data).hexdigest()
+
+
+def snapshot_inventory(host: str, **kwargs) -> Dict[str, Any]:
+    mcp = MCP.new(host, **kwargs)
+    tools = mcp.list_tools()
+    resources = mcp.list_resources()
+    prompts = mcp.list_prompts()
+    snap_tools = []
+    for t in tools:
+        snap_tools.append({
+            "name": t.get("name"),
+            "desc_hash": _sha256_of(t.get("description")),
+            "schema_hash": _sha256_of(t.get("inputSchema")),
+        })
+    snap_resources = []
+    for r in resources:
+        snap_resources.append({
+            "uri": r.get("uri"),
+            "name": r.get("name"),
+            "desc_hash": _sha256_of(r.get("description")),
+        })
+    return {
+        "host": host,
+        "server": mcp.server_info,
+        "tools": sorted(snap_tools, key=lambda x: x["name"] or ""),
+        "resources": sorted(snap_resources, key=lambda x: x.get("uri") or ""),
+        "prompts": sorted([p.get("name") for p in prompts if isinstance(p, dict)], key=lambda x: x or ""),
+        "created_at": int(time.time()),
+    }
+
+
+def diff_inventories(prev: Dict[str, Any], curr: Dict[str, Any]) -> Dict[str, Any]:
+    pt = {t["name"]: t for t in prev.get("tools", [])}
+    ct = {t["name"]: t for t in curr.get("tools", [])}
+    added_tools = [n for n in ct.keys() if n not in pt]
+    removed_tools = [n for n in pt.keys() if n not in ct]
+    changed_tools = []
+    for n in set(pt.keys()).intersection(ct.keys()):
+        if pt[n].get("desc_hash") != ct[n].get("desc_hash") or pt[n].get("schema_hash") != ct[n].get("schema_hash"):
+            changed_tools.append(n)
+
+    pr = {r.get("uri"): r for r in prev.get("resources", [])}
+    cr = {r.get("uri"): r for r in curr.get("resources", [])}
+    added_res = [u for u in cr.keys() if u not in pr]
+    removed_res = [u for u in pr.keys() if u not in cr]
+    changed_res = []
+    for u in set(pr.keys()).intersection(cr.keys()):
+        if pr[u].get("desc_hash") != cr[u].get("desc_hash"):
+            changed_res.append(u)
+
+    pp = set(prev.get("prompts", []) or [])
+    cp = set(curr.get("prompts", []) or [])
+    return {
+        "tools": {"added": added_tools, "removed": removed_tools, "changed": changed_tools},
+        "resources": {"added": added_res, "removed": removed_res, "changed": changed_res},
+        "prompts": {"added": sorted(list(cp - pp)), "removed": sorted(list(pp - cp))},
+    }
 def _resolve_env_path(env_path: str | None) -> str | None:
     script_dir = os.path.dirname(os.path.abspath(__file__))
     # If absolute and exists
@@ -558,8 +806,9 @@ def call_mcp_tool(registry: Dict[str, Dict[str, Any]], reg_key: str, arguments: 
             return "\n".join(texts)[:8000]
     return (json.dumps(res, ensure_ascii=False) if not isinstance(res, str) else res)[:8000]
 
-def chat_with_claude(hosts: List[str], model: str, env_path: str, **kwargs) -> None:
-    _load_env_file(env_path)
+def chat_with_claude(hosts: List[str], model: str, **kwargs) -> None:
+    # Load default .env from script directory if present
+    _load_env_file(None)
     if anthropic is None:
         raise SystemExit("anthropic package is not installed. Please install dependencies.")
     api_key = os.getenv("ANTHROPIC_API_KEY")
@@ -661,10 +910,16 @@ if __name__ == "__main__":
                         help="Custom SSE endpoint path (default: /sse)")
     parser.add_argument("--chat", action="store_true",
                         help="Start an interactive chat with a Claude LLM agent over MCP tools")
-    parser.add_argument("--model", type=str, default="claude-3-7-sonnet-20250219",
+    parser.add_argument("--model", type=str, default="claude-sonnet-4-20250514",
                         help="Anthropic model to use for chat (default: %(default)s)")
-    parser.add_argument("--env-file", type=str, default=".env",
-                        help="Path to .env file with ANTHROPIC_API_KEY (default: .env)")
+    parser.add_argument("--audit", action="store_true",
+                        help="Run a quick general audit against the host(s) and print a concise report")
+    parser.add_argument("--audit-json", type=Path,
+                        help="Optional path to write the audit JSON report")
+    parser.add_argument("--baseline", type=Path,
+                        help="Save a baseline inventory snapshot to this path and exit")
+    parser.add_argument("--diff", type=Path,
+                        help="Diff current inventory against this baseline JSON and print a summary")
 
     args = parser.parse_args()
 
@@ -704,7 +959,59 @@ if __name__ == "__main__":
         else:
             hosts = [args.host]
         hosts = [h if h.startswith("http") else "http://" + h for h in hosts]
-        chat_with_claude(hosts, model=args.model, env_path=args.env_file, timeout=args.timeout, verify=verify, token=args.token, proxies=proxies, headers=extra_headers, http_path=args.http_path, sse_path=args.sse_path)
+        chat_with_claude(hosts, model=args.model, timeout=args.timeout, verify=verify, token=args.token, proxies=proxies, headers=extra_headers, http_path=args.http_path, sse_path=args.sse_path)
+        raise SystemExit(0)
+
+    if args.audit:
+        if args.file:
+            hosts = args.file.read_text().splitlines()
+        else:
+            hosts = [args.host]
+        hosts = [h if h.startswith("http") else "http://" + h for h in hosts]
+
+        all_reports: List[Dict[str, Any]] = []
+        for h in hosts:
+            try:
+                rep = audit_inventory(h, timeout=args.timeout, verify=verify, token=args.token, proxies=proxies, headers=extra_headers, http_path=args.http_path, sse_path=args.sse_path)
+                print_audit_report(rep)
+                all_reports.append(rep)
+            except Exception as e:
+                print(f"[!] Audit failed for {h}: {e}")
+        if args.audit_json:
+            try:
+                with args.audit_json.open("w") as f:
+                    json.dump(all_reports, f, indent=2)
+                print(f"Audit JSON written to {args.audit_json}")
+            except Exception as e:
+                print(f"[!] Failed to write audit JSON: {e}")
+        raise SystemExit(0)
+
+    # Baseline snapshot
+    if args.baseline:
+        if args.file:
+            hosts = args.file.read_text().splitlines()
+        else:
+            hosts = [args.host]
+        hosts = [h if h.startswith("http") else "http://" + h for h in hosts]
+        # Only first host for baseline (can extend later)
+        snap = snapshot_inventory(hosts[0], timeout=args.timeout, verify=verify, token=args.token, proxies=proxies, headers=extra_headers, http_path=args.http_path, sse_path=args.sse_path)
+        with args.baseline.open("w") as f:
+            json.dump(snap, f, indent=2)
+        print(f"Baseline written to {args.baseline}")
+        raise SystemExit(0)
+
+    # Diff mode
+    if args.diff:
+        base = json.loads(args.diff.read_text())
+        if args.file:
+            hosts = args.file.read_text().splitlines()
+        else:
+            hosts = [args.host]
+        hosts = [h if h.startswith("http") else "http://" + h for h in hosts]
+        cur = snapshot_inventory(hosts[0], timeout=args.timeout, verify=verify, token=args.token, proxies=proxies, headers=extra_headers, http_path=args.http_path, sse_path=args.sse_path)
+        d = diff_inventories(base, cur)
+        print("\n=== Inventory Diff ===")
+        print(json.dumps(d, indent=2))
         raise SystemExit(0)
 
     if not args.name_or_uri:

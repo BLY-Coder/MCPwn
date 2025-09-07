@@ -29,6 +29,27 @@ python3 MCPwn.py localhost:9001 get_user_info '{"username": "admin"}'
 python3 MCPwn.py localhost:9001 internal://credentials
 ```
 
+**Quick audit (non-destructive):**
+```bash
+python3 MCPwn.py --audit localhost:9001
+# Optional JSON report
+python3 MCPwn.py --audit --audit-json /tmp/audit.json localhost:9001
+```
+
+**Baseline & diff:**
+```bash
+# Save inventory snapshot
+python3 MCPwn.py --baseline /tmp/base.json localhost:9001
+# Compare current inventory vs baseline
+python3 MCPwn.py --diff /tmp/base.json localhost:9001
+```
+
+**Chat (Claude + MCP tools):**
+```bash
+# Requires ANTHROPIC_API_KEY in /opt/MCPwn/.env
+python3 MCPwn.py --chat localhost:9001
+```
+
 ## Proxy Integration (Burp Suite)
 
 **Use with Burp Suite:**
@@ -53,6 +74,10 @@ python3 MCPwn.py --proxy http://127.0.0.1:8080 localhost:9001
 -o OUTPUT         # Save results to JSON
 -t TIMEOUT        # Request timeout
 -T THREADS        # Concurrent threads
+--audit           # Quick audit with risk hints & safe error probing
+--baseline FILE   # Save baseline inventory snapshot
+--diff FILE       # Diff current inventory against baseline
+--chat            # Interactive chat (Claude) using MCP tools
 ```
 
 ## Security Testing Examples
