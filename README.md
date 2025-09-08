@@ -14,6 +14,8 @@ pip install -r requirements.txt
 
 ## Usage
 
+
+[![PoC](https://asciinema.org/a/IOEb1gh8iKAEKc4M13JtwG9uv.svg)](https://asciinema.org/a/IOEb1gh8iKAEKc4M13JtwG9uv?autoplay=1)
 **List tools and resources:**
 ```bash
 python3 MCPwn.py localhost:9001
