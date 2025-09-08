@@ -1,5 +1,7 @@
 # MCPwn Dependencies
 requests>=2.28.0
 urllib3>=1.26.0
+
+# Optional dependencies for chat functionality
+anthropic>=0.66.0
 python-dotenv>=1.0.1
-anthropic>=0.34.0
