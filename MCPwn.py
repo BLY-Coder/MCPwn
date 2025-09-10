@@ -33,10 +33,15 @@ class SSE:
         self.iter = r.iter_lines()
 
     def get_line(self):
-        line = next(self.iter).split(b":", 1)
-        if len(line) == 1:
+        line = next(self.iter)
+        # Skip problematic lines like [object Object] fa
+        if line == b"[object Object]" or line == b"" or not line:
+            return self.get_line()  # Recursively try next line
+        
+        parts = line.split(b":", 1)
+        if len(parts) == 1:
             raise ValueError(f"Missing colon separator: {line!r}")
-        name, value = line[0], line[1].lstrip()
+        name, value = parts[0], parts[1].lstrip()
         return name, value
 
     def __next__(self):
@@ -72,7 +77,8 @@ class MCP:
         self.session = requests.Session()
         self.session.verify = verify
         self.session.headers.update({
-            "Accept": "application/json, text/event-stream"
+            "Accept": "application/json, text/event-stream",
+            "Content-Type": "application/json"
         })
         if token:
             self.session.headers["Authorization"] = f"Bearer {token}"
@@ -159,8 +165,8 @@ class MCP:
         try:
             return self.jsonrpc("resources/templates/list")["resourceTemplates"]
         except ValueError as e:
-            if isinstance(e.args[0], dict) and e.args[0].get("code") == -32601:
-                return []  # Server does not support resource templates
+            if isinstance(e.args[0], dict) and e.args[0].get("code") in [-32601, -32000]:
+                return []  # Server does not support resource templates or server error
             raise
 
     def list_resources(self):
@@ -170,8 +176,8 @@ class MCP:
         try:
             return self.jsonrpc("resources/list")["resources"] + self.list_resource_templates()
         except ValueError as e:
-            if isinstance(e.args[0], dict) and e.args[0].get("code") == -32601:
-                return []  # Server does not support resources
+            if isinstance(e.args[0], dict) and e.args[0].get("code") in [-32601, -32000]:
+                return []  # Server does not support resources or server error
             raise
 
     def list_prompts(self):
@@ -181,8 +187,8 @@ class MCP:
         try:
             return self.jsonrpc("prompts/list")["prompts"]
         except ValueError as e:
-            if isinstance(e.args[0], dict) and e.args[0].get("code") == -32601:
-                return []  # Server does not support resources
+            if isinstance(e.args[0], dict) and e.args[0].get("code") in [-32601, -32000]:
+                return []  # Server does not support prompts or server error
             raise
 
     def call_tool(self, name, arguments):
@@ -236,11 +242,12 @@ class MCP:
             result = False
         elif arguments["type"] == "array":
             result = []
-            if type(arguments["items"]) is dict:
-                result.append(MCP.tool_call_example(arguments["items"]))
-            else:
-                for item in arguments["items"]:
-                    result.append(MCP.tool_call_example(item))
+            if "items" in arguments:
+                if type(arguments["items"]) is dict:
+                    result.append(MCP.tool_call_example(arguments["items"]))
+                else:
+                    for item in arguments["items"]:
+                        result.append(MCP.tool_call_example(item))
         elif arguments["type"] == "object":
             result = {}
             if "properties" in arguments:
@@ -265,6 +272,12 @@ class SSEClient(MCP):
         self.sse = SSE(sse_url, timeout=timeout, verify=verify, headers=sse_headers, proxies=proxies)
         event, data = next(self.sse)
         assert event == "endpoint", f"Received {(event, data)}"
+        
+        # Fix for servers that return duplicated paths (like Hugging Face Gradio MCP)
+        # Remove duplicate path segments if they exist
+        if '/gradio_api/mcp/gradio_api/mcp/' in data:
+            data = data.replace('/gradio_api/mcp/gradio_api/mcp/', '/gradio_api/mcp/')
+        
         self.messages_url = urljoin(host, data)
 
         super().__init__(host, timeout=timeout, verify=verify, token=token, proxies=proxies, headers=headers, **kwargs)
@@ -344,7 +357,13 @@ class StreamableHTTPClient(MCP):
             endpoint = self.http_endpoint if getattr(self, 'http_endpoint', None) else (self.host.rstrip('/') + '/mcp')
         
         r = self.session.post(endpoint, json=payload, timeout=self.timeout)
-        assert r.ok, r.text
+        if not r.ok:
+            # For optional methods, return a graceful error instead of crashing
+            if payload.get("method") in ["resources/list", "resources/templates/list", "prompts/list"]:
+                error_msg = r.text if r.text else f"HTTP {r.status_code}"
+                raise ValueError({"code": -32000, "message": f"Server error: {error_msg}"})
+            else:
+                assert r.ok, r.text
 
         self.sid = r.headers.get("MCP-Session-ID")
         if self.sid:
@@ -1440,15 +1459,19 @@ if __name__ == "__main__":
                     else:
                         for i, prompt in enumerate(prompts, 1):
                             arguments = {arg['name']: "" for arg in prompt.get('arguments', [])}
-                            command = f"prompt/{prompt['name']} '{json.dumps(arguments)}'"
+                            prompt_name = prompt.get('name', '')
+                            command = f"prompt/{prompt_name} '{json.dumps(arguments)}'"
                             description = prompt.get('description', '')
                             
-                            if description:
-                                # Procesar toda la descripción sin truncar (igual que tools)
+                            # Show description if available, otherwise show prompt name
+                            display_text = description if description else prompt_name
+                            
+                            if display_text:
+                                # Procesar toda la descripción/nombre sin truncar (igual que tools)
                                 desc_lines = []
                                 
                                 # Dividir por líneas existentes primero (preservar formato original)
-                                original_lines = description.split('\n')
+                                original_lines = display_text.split('\n')
                                 
                                 for orig_line in original_lines:
                                     orig_line = orig_line.strip()
@@ -1476,7 +1499,7 @@ if __name__ == "__main__":
                                 # Mostrar todo sin truncar
                                 if desc_lines:
                                     # Primera línea con número
-                                    first_line = desc_lines[0] if desc_lines[0] else "(description continues below)"
+                                    first_line = desc_lines[0] if desc_lines[0] else "(continues below)"
                                     print(f"│ {i:>2}. {first_line:<72} │")
                                     
                                     # Resto de líneas de descripción
@@ -1548,8 +1571,8 @@ if __name__ == "__main__":
             else:
                 print(f"\n┌─ RESOURCE CONTENT {'─'*60}┐")
                 for i, content in enumerate(result, 1):
-                    extension = mimetypes.guess_extension(content["mimeType"])
-                    mime_type = content.get("mimeType", "unknown")
+                    mime_type = content.get("mimeType", "text/plain")
+                    extension = mimetypes.guess_extension(mime_type) or ".txt"
                     
                     if 'blob' in content:
                         with open(tempfile.mktemp(suffix=extension), "wb") as f:
@@ -1627,7 +1650,8 @@ if __name__ == "__main__":
                                     print(f"│ {current_line:<75} │")
                     elif content["type"] == "image" or content["type"] == "audio":
                         content_type = content["type"]
-                        extension = mimetypes.guess_extension(content["mimeType"])
+                        mime_type = content.get("mimeType", "application/octet-stream")
+                        extension = mimetypes.guess_extension(mime_type) or ".bin"
                         with open(tempfile.mktemp(suffix=extension), "wb") as f:
                             f.write(b64decode(content["data"]))
                         print(f"│ {content_type.title()} Content:{'':<{64-len(content_type)}} │")
@@ -1645,7 +1669,8 @@ if __name__ == "__main__":
                             if len(text_lines) > 10:
                                 print(f"│ ... ({len(text_lines)-10} more lines){'':<48} │")
                         elif 'blob' in resource:
-                            extension = mimetypes.guess_extension(resource["mimeType"])
+                            mime_type = resource.get("mimeType", "application/octet-stream")
+                            extension = mimetypes.guess_extension(mime_type) or ".bin"
                             with open(tempfile.mktemp(suffix=extension), "wb") as f:
                                 data = resource.get("text", b64decode(resource["blob"]))
                                 f.write(b64decode(data))
@@ -1693,7 +1718,8 @@ if __name__ == "__main__":
                                     print(f"│ {current_line:<75} │")
                     elif content["type"] == "image" or content["type"] == "audio":
                         content_type = content["type"]
-                        extension = mimetypes.guess_extension(content["mimeType"])
+                        mime_type = content.get("mimeType", "application/octet-stream")
+                        extension = mimetypes.guess_extension(mime_type) or ".bin"
                         with open(tempfile.mktemp(suffix=extension), "wb") as f:
                             f.write(b64decode(content["data"]))
                         print(f"│ [{i}] {content_type.title()} Content{'':<{58-len(content_type)}} │")
@@ -1724,7 +1750,8 @@ if __name__ == "__main__":
                                     if current_line:
                                         print(f"│ {current_line:<75} │")
                         elif 'blob' in resource:
-                            extension = mimetypes.guess_extension(resource["mimeType"])
+                            mime_type = resource.get("mimeType", "application/octet-stream")
+                            extension = mimetypes.guess_extension(mime_type) or ".bin"
                             with open(tempfile.mktemp(suffix=extension), "wb") as f:
                                 data = resource.get("text", b64decode(resource["blob"]))
                                 f.write(b64decode(data))
